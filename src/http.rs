@@ -1,10 +1,11 @@
 use core::time::Duration;
 use std::net::SocketAddr;
+use std::sync::LazyLock;
 use std::time::Instant;
 
+use anyhow::Context as _;
 use chardetng::EncodingDetector;
 use encoding_rs::Encoding;
-use lazy_regex::lazy_regex;
 use regex::bytes::Regex as BytesRegex;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{ClientBuilder, header};
@@ -42,9 +43,9 @@ impl core::fmt::Display for IpVersion {
 }
 
 fn extract_html_charset(bytes: &[u8]) -> Option<&'static Encoding> {
-    static META_CHARSET_RE: &lazy_regex::Lazy<BytesRegex> = lazy_regex!(
-        r#"(?i)<meta\s+[^>]*charset=["']?\s*([a-zA-Z0-9._-]+)"#
-    );
+    static META_CHARSET_RE: LazyLock<BytesRegex> = LazyLock::new(|| {
+        BytesRegex::new(r#"(?i)<meta\s+[^>]*charset=["']?\s*([a-zA-Z0-9._-]+)"#).unwrap()
+    });
 
     if let Some(captures) = META_CHARSET_RE.captures(bytes) {
         if let Some(m) = captures.get(1) {
@@ -80,9 +81,10 @@ pub async fn get(
     let content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok());
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
 
-    let extension = content_type.and_then(mime2ext::mime2ext);
+    let extension = content_type.as_deref().and_then(mime2ext::mime2ext);
     let ip_version = match response.remote_addr() {
         Some(SocketAddr::V4(_)) => IpVersion::IPv4,
         Some(SocketAddr::V6(_)) => IpVersion::IPv6,
@@ -101,7 +103,7 @@ pub async fn get(
         .map(|(enc, _)| enc)
         .or_else(|| extract_html_charset(&bytes))
         .or_else(|| {
-            content_type.and_then(|ct| {
+            content_type.as_deref().and_then(|ct| {
                 ct.split(';')
                     .find_map(|param| {
                         let param = param.trim();
