@@ -8,7 +8,7 @@ use chardetng::EncodingDetector;
 use encoding_rs::Encoding;
 use regex::bytes::Regex as BytesRegex;
 use reqwest::header::{HeaderMap, HeaderValue};
-use reqwest::{ClientBuilder, header};
+use reqwest::{ClientBuilder, StatusCode, header};
 use url::Url;
 
 use crate::editor::Content;
@@ -59,12 +59,15 @@ fn extract_html_charset(bytes: &[u8]) -> Option<&'static Encoding> {
 ///
 /// FROM provides an email address for the target host to be contacted in case of problems.
 /// See [HTTP From header](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/From)
+///
+/// Only `200 OK` with a body is a page. Other successful statuses are an error, too: a CDN or its bot protection
+/// answers `202 Accepted` with no body instead of the page, and storing that would record the page as emptied.
 pub async fn get(
     url: &str,
     additional_headers: HeaderMap,
     accept_invalid_certs: bool,
     http1_only: bool,
-) -> reqwest::Result<(Content, ResponseMeta)> {
+) -> anyhow::Result<(Content, ResponseMeta)> {
     let mut builder = ClientBuilder::new()
         .danger_accept_invalid_certs(accept_invalid_certs)
         .timeout(Duration::from_secs(30))
@@ -72,10 +75,22 @@ pub async fn get(
     if http1_only {
         builder = builder.http1_only();
     }
-    let request = builder.build()?.get(url).headers(additional_headers);
+    let request = builder
+        .build()
+        .map_err(reqwest::Error::without_url)?
+        .get(url)
+        .headers(additional_headers);
 
     let start = Instant::now();
-    let response = request.send().await?.error_for_status()?;
+    let response = request
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(reqwest::Error::without_url)?;
+    let status = response.status();
+    if status != StatusCode::OK {
+        anyhow::bail!("the server answered HTTP {status} instead of 200 OK, so this is not the page");
+    }
     let took = Instant::now().saturating_duration_since(start);
 
     let content_type = response
@@ -97,7 +112,13 @@ pub async fn get(
         url: response.url().clone(),
     };
 
-    let bytes = response.bytes().await?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(reqwest::Error::without_url)?;
+    if bytes.is_empty() {
+        anyhow::bail!("the server answered HTTP {status} with an empty body, so this is not the page");
+    }
 
     let encoding = Encoding::for_bom(&bytes)
         .map(|(enc, _)| enc)
@@ -154,4 +175,59 @@ fn from_is_no_email() {
 #[should_panic = "ASCII char"]
 fn from_is_no_ascii() {
     validate_from("föo@bär.de").unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::thread;
+
+    use reqwest::header::HeaderMap;
+
+    /// Answers one request with the given status line and body, returns the address.
+    fn serve_once(status: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 2048];
+            let _ = stream.read(&mut buf);
+            let crlf = String::from_utf8(vec![13, 10]).unwrap();
+            let response = format!(
+                "HTTP/1.1 {status}{crlf}Content-Type: text/html{crlf}Content-Length: {}{crlf}Connection: close{crlf}{crlf}{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn accepted_without_body_is_an_error() {
+        let url = serve_once("202 Accepted", "");
+        let err = super::get(&url, HeaderMap::new(), false, true).await.err().unwrap();
+        assert!(err.to_string().contains("HTTP 202"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn accepted_with_body_is_an_error() {
+        let url = serve_once("202 Accepted", "<html>challenge</html>");
+        let err = super::get(&url, HeaderMap::new(), false, true).await.err().unwrap();
+        assert!(err.to_string().contains("HTTP 202"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn ok_without_body_is_an_error() {
+        let url = serve_once("200 OK", "");
+        let err = super::get(&url, HeaderMap::new(), false, true).await.err().unwrap();
+        assert!(err.to_string().contains("empty body"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn ok_with_body_is_a_page() {
+        let url = serve_once("200 OK", "<html>page</html>");
+        let (content, _) = super::get(&url, HeaderMap::new(), false, true).await.unwrap();
+        assert_eq!(content.text, "<html>page</html>");
+    }
 }

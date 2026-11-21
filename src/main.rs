@@ -294,8 +294,7 @@ async fn stalk_and_save_site(
         site.options.accept_invalid_certs,
         site.options.http1_only,
     )
-    .await
-    .map_err(reqwest::Error::without_url)?;
+    .await?;
 
     if site.url.as_str() != response.url.as_str() {
         logger::warn(&format!(
